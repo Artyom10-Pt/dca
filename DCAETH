@@ -1,51 +1,164 @@
 from web3 import Web3
+from web3.exceptions import TransactionNotFound
 import time
 import json
+import logging
+from datetime import datetime, timedelta
+import os
+from typing import Dict
+import sys
 
-# Configuration
-INFURA_URL = "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID"
-PRIVATE_KEY = "YOUR_PRIVATE_KEY"
-WALLET_ADDRESS = "YOUR_WALLET_ADDRESS"
-TOKEN_ADDRESS = "TOKEN_CONTRACT_ADDRESS"
-UNISWAP_ROUTER_ADDRESS = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # Uniswap V3 Router
-AMOUNT_TO_BUY = Web3.to_wei(0.01, 'ether')  # Amount of ETH to buy
-INTERVAL = 3600  # Interval in seconds (1 hour)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('dca_bot.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configuration class
+class Config:
+    INFURA_URL = os.getenv("INFURA_URL", "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID")
+    PRIVATE_KEY = os.getenv("PRIVATE_KEY", "YOUR_PRIVATE_KEY")
+    WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "YOUR_WALLET_ADDRESS")
+    TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS", "TOKEN_CONTRACT_ADDRESS")
+    UNISWAP_ROUTER_ADDRESS = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # Uniswap V3 Router
+    AMOUNT_TO_BUY = Web3.to_wei(0.01, 'ether')  # Amount of ETH to buy
+    PURCHASE_HOUR = 15  # 24-hour format (3 PM UTC)
+    GAS_LIMIT = 200000
+    GAS_PRICE = Web3.to_wei('5', 'gwei')
+    FEE = 3000  # 0.3% pool fee
+    DEADLINE_BUFFER = 600  # 10 minutes deadline buffer
 
 # Initialize Web3
-w3 = Web3(Web3.HTTPProvider(INFURA_URL))
-router_abi = json.loads('[{"constant":false,"inputs":...}]')  # Uniswap router ABI
-router = w3.eth.contract(address=UNISWAP_ROUTER_ADDRESS, abi=router_abi)
+try:
+    w3 = Web3(Web3.HTTPProvider(Config.INFURA_URL))
+    if not w3.is_connected():
+        raise ConnectionError("Failed to connect to Ethereum network")
+except Exception as e:
+    logger.error(f"Web3 initialization failed: {e}")
+    sys.exit(1)
 
-def buy_token():
-    nonce = w3.eth.get_transaction_count(WALLET_ADDRESS)
-    txn = router.functions.exactInputSingle({
-        'tokenIn': w3.to_checksum_address(w3.eth.default_account),
-        'tokenOut': w3.to_checksum_address(TOKEN_ADDRESS),
-        'fee': 3000,  # Pool fee (0.3%)
-        'recipient': WALLET_ADDRESS,
-        'deadline': int(time.time()) + 600,
-        'amountIn': AMOUNT_TO_BUY,
-        'amountOutMinimum': 0,
-        'sqrtPriceLimitX96': 0
-    }).build_transaction({
-        'from': WALLET_ADDRESS,
-        'value': AMOUNT_TO_BUY,
-        'gas': 200000,
-        'gasPrice': w3.to_wei('5', 'gwei'),
-        'nonce': nonce
-    })
-    
-    signed_txn = w3.eth.account.sign_transaction(txn, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
-    print(f'Transaction sent: {tx_hash.hex()}')
+# Load Uniswap Router ABI (should be stored in a separate file in production)
+try:
+    with open('uniswap_v3_router_abi.json', 'r') as f:
+        router_abi = json.load(f)
+except FileNotFoundError:
+    logger.error("Uniswap V3 Router ABI file not found")
+    sys.exit(1)
 
-def run_dca():
-    while True:
+router = w3.eth.contract(address=Config.UNISWAP_ROUTER_ADDRESS, abi=router_abi)
+
+class DCABot:
+    def __init__(self):
+        self.config = Config()
+        w3.eth.default_account = self.config.WALLET_ADDRESS
+
+    def get_next_purchase_time(self) -> datetime:
+        """Calculate the next purchase time based on PURCHASE_HOUR"""
+        now = datetime.utcnow()
+        target = now.replace(hour=self.config.PURCHASE_HOUR, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        return target
+
+    def check_balance(self) -> bool:
+        """Check if wallet has sufficient ETH balance"""
+        balance = w3.eth.get_balance(self.config.WALLET_ADDRESS)
+        required = self.config.AMOUNT_TO_BUY + (self.config.GAS_PRICE * self.config.GAS_LIMIT)
+        if balance < required:
+            logger.error(f"Insufficient balance: {w3.from_wei(balance, 'ether')} ETH, "
+                        f"Required: {w3.from_wei(required, 'ether')} ETH")
+            return False
+        return True
+
+    def build_transaction(self, nonce: int) -> Dict:
+        """Build the Uniswap V3 transaction"""
+        params = {
+            'tokenIn': w3.to_checksum_address(w3.eth.default_account),
+            'tokenOut': w3.to_checksum_address(self.config.TOKEN_ADDRESS),
+            'fee': self.config.FEE,
+            'recipient': self.config.WALLET_ADDRESS,
+            'deadline': int(time.time()) + self.config.DEADLINE_BUFFER,
+            'amountIn': self.config.AMOUNT_TO_BUY,
+            'amountOutMinimum': 0,  # Consider adding slippage protection
+            'sqrtPriceLimitX96': 0
+        }
+        
+        return router.functions.exactInputSingle(params).build_transaction({
+            'from': self.config.WALLET_ADDRESS,
+            'value': self.config.AMOUNT_TO_BUY,
+            'gas': self.config.GAS_LIMIT,
+            'gasPrice': self.config.GAS_PRICE,
+            'nonce': nonce
+        })
+
+    def buy_token(self) -> bool:
+        """Execute the token purchase"""
         try:
-            buy_token()
+            if not self.check_balance():
+                return False
+
+            nonce = w3.eth.get_transaction_count(self.config.WALLET_ADDRESS)
+            txn = self.build_transaction(nonce)
+            
+            signed_txn = w3.eth.account.sign_transaction(txn, self.config.PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            
+            logger.info(f"Transaction sent: {tx_hash.hex()}")
+            
+            # Wait for transaction confirmation
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+            logger.info(f"Transaction confirmed - Gas used: {receipt.gasUsed}")
+            return True
+            
+        except ValueError as e:
+            logger.error(f"Transaction error: {e}")
+            return False
+        except TransactionNotFound:
+            logger.error("Transaction failed to confirm")
+            return False
         except Exception as e:
-            print(f'Error: {e}')
-        time.sleep(INTERVAL)
+            logger.error(f"Purchase failed: {e}")
+            return False
+
+    def run(self) -> None:
+        """Main bot execution loop"""
+        logger.info("DCA Bot started")
+        while True:
+            try:
+                next_purchase = self.get_next_purchase_time()
+                sleep_seconds = (next_purchase - datetime.utcnow()).total_seconds()
+                
+                if sleep_seconds > 0:
+                    logger.info(f"Next purchase scheduled for {next_purchase} UTC "
+                               f"({int(sleep_seconds/3600)} hours from now)")
+                    time.sleep(sleep_seconds)
+                
+                logger.info(f"Executing purchase at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                success = self.buy_token()
+                
+                if not success:
+                    logger.warning("Purchase failed, will retry next cycle")
+                    
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                time.sleep(300)  # Wait 5 minutes before retrying on major error
 
 if __name__ == "__main__":
-    run_dca()
+    # Validate configuration
+    required_configs = [
+        Config.INFURA_URL, 
+        Config.PRIVATE_KEY, 
+        Config.WALLET_ADDRESS, 
+        Config.TOKEN_ADDRESS
+    ]
+    if any("YOUR_" in config for config in required_configs):
+        logger.error("Please configure all required parameters in environment variables or Config class")
+        sys.exit(1)
+
+    bot = DCABot()
+    bot.run()
